@@ -1,0 +1,8 @@
+streamlit==1.43.2
+pandas
+yt-dlp
+requests==2.31.0
+requests
+openpyxl
+gspread
+oauth2client
