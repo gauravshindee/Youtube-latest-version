@@ -146,7 +146,7 @@ def clean_and_normalize_df(df):
     if "video_link" in df.columns and "link" not in df.columns:
         df.rename(columns={"video_link": "link"}, inplace=True)
 
-    # 3. Create the missing 'video_id' column from the 'link' column 
+    # 3. Create the missing 'video_id' column from the 'link' column (FIX for KeyError: 'video_id')
     if "link" in df.columns and "video_id" not in df.columns:
         df["video_id"] = df["link"].apply(extract_youtube_id)
         
@@ -200,6 +200,7 @@ def load_sheet(name):
             
         return gs_client.open_by_key(GOOGLE_SHEET_ID).worksheet(name)
     except RefreshError as e:
+        # Cited error: No access token in response
         st.error(f"Google Sheets Connection Error: No access token in response. Please check the 'gcp_service_account' secret and permissions. Error: {e}") 
         st.stop()
     except Exception as e:
@@ -340,14 +341,14 @@ def apply_quickwatch_filters(df, prefix):
         ticketed_ids = set(tickets_df["video_id"].astype(str)) if not tickets_df.empty else set()
         
         # This check is now safe because 'video_id' is created in clean_and_normalize_df
-        if "video_id" in filtered.columns: # Guard against missing video_id even after extraction attempt
+        if "video_id" in filtered.columns:
             if ticket_filter == "Ticket Created":
                 filtered = filtered[filtered["video_id"].astype(str).isin(ticketed_ids)]
             elif ticket_filter == "No Ticket":
                 filtered = filtered[~filtered["video_id"].astype(str).isin(ticketed_ids)]
         else:
-             st.warning("Cannot filter by ticket status: 'video_id' column is missing or could not be extracted.")
-             # If video_id is truly missing, filtering won't work, so just return the date/search filtered df
+             st.warning("Cannot filter by ticket status: 'video_id' could not be determined from video link.")
+             # Fall back to showing all videos if the required column for filtering is missing
 
     return filtered, start_date, end_date
 
@@ -412,38 +413,34 @@ def display_quickwatch_style_list(df, view_name, prefix, tickets_df):
                 st.rerun()
         
         with col3:
-            # Only enable ticket button if video_id is available
-            if "video_id" in video and vid and vid != f"no_id_{page}_{i}": # Ensure video_id is a real one
-                if vid in ticketed_ids:
-                    # Safely retrieve ticket row
-                    ticket_row = tickets_df[tickets_df["video_id"].astype(str) == vid]
-                    if not ticket_row.empty:
-                        ticket_row = ticket_row.iloc[0]
-                        st.success(f"🎫 Ticket Created: [#{ticket_row['ticket_created']}]({ticket_row['ticket_url']})")
-                    else:
-                        st.warning("Ticket status mismatch.")
+            if vid in ticketed_ids:
+                # Safely retrieve ticket row
+                ticket_row = tickets_df[tickets_df["video_id"].astype(str) == vid]
+                if not ticket_row.empty:
+                    ticket_row = ticket_row.iloc[0]
+                    st.success(f"🎫 Ticket Created: [#{ticket_row['ticket_created']}]({ticket_row['ticket_url']})")
                 else:
-                    if st.button("🎫 Create Ticket", key=f"ticket_{unique_key_base}"):
-                        subject = f"Video Review: {video.get('title', 'Unknown Title')}"
-                        description = (
-                            f"Video ID: {vid}\n"
-                            f"Title: {video.get('title', 'Unknown Title')}\n"
-                            f"Channel: {video.get('channel_name', 'Unknown Channel')}\n"
-                            f"Date: {video.get('publish_date', 'Unknown Date')}\n"
-                            f"Link: {video.get('link', 'No Link')}"
-                        )
-                        success, result = create_zendesk_ticket(subject, description)
-                        if success:
-                            ticket_id = result["ticket"]["id"]
-                            ticket_url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}"
-                            save_ticket_marker(video, ticket_id, ticket_url)
-                            st.success(f"✅ Ticket #{ticket_id} created!")
-                            st.rerun()
-                        else:
-                            st.error(f"❌ Failed to create ticket: {result}")
+                    st.warning("Ticket status mismatch.")
             else:
-                st.markdown("<p style='color: grey;'>Ticket creation unavailable (no video ID)</p>", unsafe_allow_html=True)
-
+                if st.button("🎫 Create Ticket", key=f"ticket_{unique_key_base}"):
+                    subject = f"Video Review: {video.get('title', 'Unknown Title')}"
+                    description = (
+                        f"Video ID: {vid}\n"
+                        f"Title: {video.get('title', 'Unknown Title')}\n"
+                        f"Channel: {video.get('channel_name', 'Unknown Channel')}\n"
+                        f"Date: {video.get('publish_date', 'Unknown Date')}\n"
+                        f"Link: {video.get('link', 'No Link')}"
+                    )
+                    success, result = create_zendesk_ticket(subject, description)
+                    if success:
+                        ticket_id = result["ticket"]["id"]
+                        ticket_url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/agent/tickets/{ticket_id}"
+                        save_ticket_marker(video, ticket_id, ticket_url)
+                        st.success(f"✅ Ticket #{ticket_id} created!")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Failed to create ticket: {result}")
+        
         st.markdown("---") 
     
     # --- Bottom Pagination ---
@@ -456,7 +453,7 @@ def display_quickwatch_style_list(df, view_name, prefix, tickets_df):
 
 # --- Authentication Check (Centralized) ---
 def check_authentication():
-    """Checks session state and handles login/timeout, with updated UI."""
+    """Checks session state and handles login/timeout."""
     
     auth_time = st.session_state["login_time"]
     time_since_login = time.time() - auth_time
@@ -466,14 +463,8 @@ def check_authentication():
     
     st.session_state["authenticated"] = False
     
-    # --- Updated Login UI ---
-    st.markdown("<h2 style='text-align: center;'>🔐 Welcome to DemoUp Dashboard</h2>", unsafe_allow_html=True)
-    st.markdown("<br>", unsafe_allow_html=True) # Add some spacing
-
-    # Use columns to visually center the password input
-    col_left, col_center, col_right = st.columns([1, 2, 1])
-    with col_center:
-        password = st.text_input("Password", type="password", help="Enter your password to access the dashboard.")
+    st.markdown("## 🔐 Welcome to DemoUp Dashboard")
+    password = st.text_input("Password", type="password")
     
     if password == CORRECT_PASSWORD:
         st.session_state["authenticated"] = True
@@ -493,7 +484,7 @@ check_authentication()
 
 st.title("📺 YouTube Video Dashboard")
 
-view = st.sidebar.radio("📂 Select View", ["⚡ QuickWatch", "🚫 Not Relevant", "📥 Already Downloaded", "📦 Archive (Official Videos)", "📦 Archive (Third-Party Videos)"])
+view = st.sidebar.radio("📂 Select View", ["⚡ QuickWatch", "🚫 Not Relevant", "📥 Already Downloaded", "📦 Archive (Official)", "📦 Archive (Third-Party)"])
 
 tickets_df = load_tickets_created()
 
