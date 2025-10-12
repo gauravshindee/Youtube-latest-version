@@ -10,12 +10,13 @@ import requests
 import gspread
 import subprocess
 import base64
-import re  # Import the regex module
+import re
 from oauth2client.service_account import ServiceAccountCredentials
 from google.auth.exceptions import RefreshError
+from itertools import islice
 
 # NOTE: Assuming fetch_videos.py and its function fetch_all are available
-# from fetch_videos import fetch_all as fetch_videos_main 
+# from fetch_videos import fetch_all as fetch_videos_main
 
 # --- UI Config and Session State Initialization (MUST BE FIRST) ---
 st.set_page_config(page_title="YouTube Video Dashboard", layout="wide")
@@ -29,12 +30,29 @@ if "login_time" not in st.session_state:
 # --- Constants & Auth Config ---
 CORRECT_PASSWORD = "DemoUp2025!"
 LOGIN_TIMEOUT = 2 * 60 * 60  # 7200 seconds (2 hours)
-# Ensure these secrets are defined in your Streamlit secrets.toml file
+
+# --- Secrets (MUST exist in Streamlit secrets) ---
 GOOGLE_SHEET_ID = st.secrets.get("GOOGLE_SHEET_ID")
+
 ZENDESK_SUBDOMAIN = st.secrets.get("ZENDESK_SUBDOMAIN", "")
 ZENDESK_EMAIL = st.secrets.get("ZENDESK_EMAIL", "")
 ZENDESK_API_TOKEN = st.secrets.get("ZENDESK_API_TOKEN", "TO_BE_ADDED_BY_ADMIN")
 
+# New: Zendesk allocation config
+def _to_int(v, default=0):
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+ZENDESK_VIEW_ID = _to_int(st.secrets.get("ZENDESK_VIEW_ID", 0))
+ZENDESK_LIGHT_AGENT_FIELD_ID = _to_int(st.secrets.get("ZENDESK_LIGHT_AGENT_FIELD_ID", 0))
+# Comma-separated list of agent IDs in secrets, e.g. "123,456,789"
+ZENDESK_AGENT_IDS = [
+    _to_int(x) for x in str(st.secrets.get("ZENDESK_AGENT_IDS", "")).split(",") if str(x).strip().isdigit()
+]
+
+# --- Sheet names ---
 QUICKWATCH_SHEET = "quickwatch"
 NOT_RELEVANT_SHEET = "not_relevant"
 ALREADY_DOWNLOADED_SHEET = "already downloaded"
@@ -65,33 +83,128 @@ def authorize_gspread_client():
         return None
 
 gs_client = authorize_gspread_client()
-
 if gs_client is None:
     st.stop()
 
-# --- Zendesk Helper (Remains the same) ---
+# --- Zendesk Helpers ---
 def create_zendesk_ticket(subject, description):
     if not ZENDESK_SUBDOMAIN or not ZENDESK_EMAIL or ZENDESK_API_TOKEN == "TO_BE_ADDED_BY_ADMIN":
         return False, "Zendesk API token not set. Please ask your admin."
 
     url = f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2/tickets.json"
-    auth_str = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}" 
+    auth_str = f"{ZENDESK_EMAIL}/token:{ZENDESK_API_TOKEN}"
     auth_bytes = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
 
     headers = {"Content-Type": "application/json", "Authorization": f"Basic {auth_bytes}"}
     payload = {
         "ticket": {
             "subject": subject,
-            "comment": { "body": description },
+            "comment": {"body": description},
             "priority": "normal"
         }
     }
 
-    response = requests.post(url, headers=headers, json=payload)
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
     if response.status_code == 201:
         return True, response.json()
     else:
         return False, response.text
+
+# Round-robin assignment helpers
+def _zd_auth():
+    return (f"{ZENDESK_EMAIL}/token", ZENDESK_API_TOKEN)
+
+def _zd_base():
+    return f"https://{ZENDESK_SUBDOMAIN}.zendesk.com/api/v2"
+
+def zd_get_tickets_from_view(view_id: int) -> list[int]:
+    """Return a list of ticket IDs from the view (handles pagination)."""
+    url = f"{_zd_base()}/views/{view_id}/tickets.json?per_page=100"
+    ids = []
+    while url:
+        r = requests.get(url, auth=_zd_auth(), timeout=30)
+        if r.status_code in (401, 403):
+            raise RuntimeError(f"Auth error {r.status_code}: {r.text[:200]}")
+        r.raise_for_status()
+        data = r.json()
+        ids.extend([t["id"] for t in data.get("tickets", [])])
+        url = data.get("next_page")
+    return ids
+
+def _chunks(iterable, size):
+    it = iter(iterable)
+    while True:
+        chunk = list(islice(it, size))
+        if not chunk:
+            return
+        yield chunk
+
+def zd_update_group(ids_chunk: list[int], field_id: int, agent_id: int) -> str | None:
+    """Update a chunk of ticket IDs to set the Light Agent custom field to agent_id. Returns job_status URL."""
+    ids_param = ",".join(map(str, ids_chunk))
+    url = f"{_zd_base()}/tickets/update_many.json?ids={ids_param}"
+    payload = {
+        "ticket": {
+            "custom_fields": [
+                {"id": field_id, "value": agent_id}
+            ]
+        }
+    }
+    r = requests.put(
+        url,
+        auth=_zd_auth(),
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload),
+        timeout=60
+    )
+    r.raise_for_status()
+    return r.json().get("job_status", {}).get("url")
+
+def zd_mass_assign_light_agent_round_robin(view_id: int, field_id: int, agent_ids: list[int]) -> dict:
+    """
+    Runs round-robin assignment and returns a result dict:
+    {
+      "total": int,
+      "distribution": [{ "agent_id": int, "count": int }],
+      "jobs": [{"agent_id": int, "url": str}],
+    }
+    """
+    if not (ZENDESK_SUBDOMAIN and ZENDESK_EMAIL and ZENDESK_API_TOKEN):
+        raise RuntimeError("Zendesk secrets not configured. Ask admin to set ZENDESK_* in secrets.")
+    if not view_id or not field_id or not agent_ids:
+        raise RuntimeError("Missing view_id/field_id/agent_ids configuration.")
+
+    ticket_ids = zd_get_tickets_from_view(view_id)
+    if not ticket_ids:
+        return {"total": 0, "distribution": [], "jobs": []}
+
+    # bucket round-robin
+    buckets = {aid: [] for aid in agent_ids}
+    for idx, tid in enumerate(ticket_ids):
+        aid = agent_ids[idx % len(agent_ids)]
+        buckets[aid].append(tid)
+
+    # update per agent in chunks
+    jobs = []
+    for aid, ids in buckets.items():
+        for chunk in _chunks(ids, 100):
+            time.sleep(0.5)  # gentle rate limiting
+            try:
+                job_url = zd_update_group(chunk, ZENDESK_LIGHT_AGENT_FIELD_ID, aid)
+                if job_url:
+                    jobs.append({"agent_id": aid, "url": job_url})
+            except requests.exceptions.RequestException as e:
+                jobs.append({"agent_id": aid, "url": f"ERROR: {e}"})
+
+    # build distribution
+    base = len(ticket_ids) // len(agent_ids)
+    rem = len(ticket_ids) % len(agent_ids)
+    distribution = []
+    for i, aid in enumerate(agent_ids):
+        count = base + (1 if i < rem else 0)
+        distribution.append({"agent_id": aid, "count": count})
+
+    return {"total": len(ticket_ids), "distribution": distribution, "jobs": jobs}
 
 # --- Download Archives (Ensures files exist before loading) ---
 RAW_ZIP_URL_OFFICIAL = "https://raw.githubusercontent.com/gauravshindee/youtube-dashboard/main/data/archive.csv.zip"
@@ -121,75 +234,62 @@ def extract_youtube_id(url):
     """Extracts YouTube ID from various URL formats."""
     if pd.isna(url):
         return None
-    
-    # Standard watch link
     match_watch = re.search(r'(?<=v=)[\w-]+', str(url))
     if match_watch:
         return match_watch.group(0)
-
-    # Shortened/Embed link
     match_short = re.search(r'(?:youtu\.be\/|embed\/)([\w-]+)', str(url))
     if match_short:
         return match_short.group(1)
-        
     return None
 
 def clean_and_normalize_df(df):
     """Helper to clean column names, fix link mapping, and ensure 'video_id' exists."""
     if df.empty:
         return df
-        
-    # 1. Normalize column names (strip whitespace, lowercase, replace spaces)
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
-    
-    # 2. Fix the link column mapping (if CSV uses 'video_link' instead of 'link')
     if "video_link" in df.columns and "link" not in df.columns:
         df.rename(columns={"video_link": "link"}, inplace=True)
-
-    # 3. Create the missing 'video_id' column from the 'link' column (FIX for KeyError: 'video_id')
     if "link" in df.columns and "video_id" not in df.columns:
         df["video_id"] = df["link"].apply(extract_youtube_id)
-        
     return df
 
 @st.cache_data
 def load_official_archive():
-    """Load the official archive CSV with robust parsing and column correction."""
     file_path = "data/archive.csv"
     if os.path.exists(file_path):
         try:
-            # Robust parsing for malformed CSVs
-            df = pd.read_csv(file_path, 
-                             encoding='latin-1', 
-                             sep=',', 
-                             quotechar='"', 
-                             doublequote=True,
-                             on_bad_lines='warn') 
+            df = pd.read_csv(
+                file_path,
+                encoding='latin-1',
+                sep=',',
+                quotechar='"',
+                doublequote=True,
+                on_bad_lines='warn'
+            )
             return clean_and_normalize_df(df)
         except Exception as e:
-            st.error(f"Failed to read archive.csv: {e}") 
+            st.error(f"Failed to read archive.csv: {e}")
             return pd.DataFrame()
     return pd.DataFrame()
 
 @st.cache_data
 def load_third_party_archive():
-    """Load the third party archive CSV with robust parsing and column correction."""
     file_path = "data/archive_third_party.csv"
     if os.path.exists(file_path):
         try:
-            # Robust parsing for malformed CSVs
-            df = pd.read_csv(file_path, 
-                             encoding='latin-1', 
-                             sep=',', 
-                             quotechar='"', 
-                             doublequote=True,
-                             on_bad_lines='warn')
+            df = pd.read_csv(
+                file_path,
+                encoding='latin-1',
+                sep=',',
+                quotechar='"',
+                doublequote=True,
+                on_bad_lines='warn'
+            )
             return clean_and_normalize_df(df)
         except Exception as e:
             st.error(f"Failed to read archive_third_party.csv: {e}")
             return pd.DataFrame()
     return pd.DataFrame()
-
 
 # --- Sheet Helpers (with RefreshError check) ---
 def load_sheet(name):
@@ -197,13 +297,13 @@ def load_sheet(name):
     try:
         if gs_client is None:
             raise Exception("Google Sheets client is not authorized.")
-            
         return gs_client.open_by_key(GOOGLE_SHEET_ID).worksheet(name)
     except RefreshError as e:
-        # Cited error: No access token in response
-        st.error(f"Google Sheets Connection Error: No access token in response. Please check the 'gcp_service_account' secret and permissions. Error: {e}") 
+        st.error("Google Sheets Connection Error: No access token in response. "
+                 "Please check the 'gcp_service_account' secret and permissions. "
+                 f"Error: {e}")
         st.stop()
-    except Exception as e:
+    except Exception:
         return None
 
 def normalize_df(records):
@@ -229,7 +329,7 @@ def load_tickets_created():
     sheet = load_sheet(TICKETS_CREATED_SHEET)
     return normalize_df(sheet.get_all_records()) if sheet else pd.DataFrame()
 
-# --- Action Helpers (Remains the same) ---
+# --- Action Helpers ---
 def save_ticket_marker(video, ticket_id, ticket_url):
     try:
         sh = gs_client.open_by_key(GOOGLE_SHEET_ID)
@@ -276,19 +376,16 @@ def remove_from_quickwatch(video_id):
         row_to_delete = None
         for i, row in enumerate(all_rows):
             if str(row.get("video_id")) == str(video_id):
-                row_to_delete = i + 2  
+                row_to_delete = i + 2
                 break
-        
         if row_to_delete:
             qsheet.delete_rows(row_to_delete)
         else:
             st.warning(f"Video ID {video_id} not found in QuickWatch sheet.")
-
     except Exception as e:
         st.error(f"❌ Failed to remove from quickwatch: {e}")
 
 # --- Common UI Components ---
-
 def apply_quickwatch_filters(df, prefix):
     """Applies search, channel, and date/ticket filters to a DataFrame."""
     if df.empty:
@@ -296,7 +393,7 @@ def apply_quickwatch_filters(df, prefix):
 
     # Ensure date column exists and is datetime
     if "publish_date" not in df.columns:
-        df["publish_date"] = pd.NaT 
+        df["publish_date"] = pd.NaT
     else:
         df["publish_date"] = pd.to_datetime(df["publish_date"], errors="coerce")
 
@@ -307,19 +404,15 @@ def apply_quickwatch_filters(df, prefix):
         ch_options = ["All"] + sorted(df["channel_name"].dropna().unique())
         ch = st.selectbox("🎞 Channel", ch_options, key=f"{prefix}_channel")
     with col3:
-        # Define safe min/max dates
         min_date_df = df["publish_date"].min()
         max_date_df = df["publish_date"].max()
-        
         min_date = min_date_df.date() if not pd.isnull(min_date_df) else pd.Timestamp('2000-01-01').date()
         max_date = max_date_df.date() if not pd.isnull(max_date_df) else pd.Timestamp('2030-01-01').date()
-        
         try:
             start_date, end_date = st.date_input("📅 Date range", [min_date, max_date], key=f"{prefix}_date")
         except ValueError:
             st.warning("Please select a valid date range.")
             return pd.DataFrame(), None, None
-        
     with col4:
         ticket_filter = st.selectbox("🎫 Ticket Status", ["All", "Ticket Created", "No Ticket"], key=f"{prefix}_ticket_filter")
 
@@ -328,74 +421,58 @@ def apply_quickwatch_filters(df, prefix):
         filtered = filtered[filtered["title"].str.contains(q, case=False, na=False)]
     if ch != "All":
         filtered = filtered[filtered["channel_name"] == ch]
-    
-    # Filter by date range
+
     filtered = filtered[
-        (filtered["publish_date"].dt.date >= start_date) & 
+        (filtered["publish_date"].dt.date >= start_date) &
         (filtered["publish_date"].dt.date <= end_date)
     ]
-    
-    # Apply Ticket Filter 
+
     if ticket_filter in ["Ticket Created", "No Ticket"]:
         tickets_df = load_tickets_created()
         ticketed_ids = set(tickets_df["video_id"].astype(str)) if not tickets_df.empty else set()
-        
-        # This check is now safe because 'video_id' is created in clean_and_normalize_df
         if "video_id" in filtered.columns:
             if ticket_filter == "Ticket Created":
                 filtered = filtered[filtered["video_id"].astype(str).isin(ticketed_ids)]
             elif ticket_filter == "No Ticket":
                 filtered = filtered[~filtered["video_id"].astype(str).isin(ticketed_ids)]
         else:
-             st.warning("Cannot filter by ticket status: 'video_id' could not be determined from video link.")
-             # Fall back to showing all videos if the required column for filtering is missing
-
+            st.warning("Cannot filter by ticket status: 'video_id' could not be determined from video link.")
     return filtered, start_date, end_date
 
 def display_quickwatch_style_list(df, view_name, prefix, tickets_df):
     """Displays a list of videos with player, top/bottom pagination, and action buttons."""
-    
     if df.empty:
         st.info(f"No results found in {view_name}.")
         return
 
     ticketed_ids = set(tickets_df["video_id"].astype(str)) if not tickets_df.empty else set()
-    
-    # --- Pagination Setup ---
+
     st.markdown(f"**🔎 {len(df)} results**")
     per_page = 10
     total_pages = max(1, (len(df) - 1) // per_page + 1)
-    
-    # --- Top Pagination ---
+
     top_page_col1, top_page_col2 = st.columns([1, 10])
     with top_page_col1:
         page = st.number_input("Page", 1, total_pages, 1, key=f"{prefix}_page_top")
     with top_page_col2:
         st.markdown(f"Page {page} of {total_pages}")
-    
-    # Slice the DataFrame for the current page
+
     videos_to_display = df.iloc[(page-1)*per_page:page*per_page].to_dict("records")
 
-    # --- Video Display Loop ---
     for i, video in enumerate(videos_to_display):
-        # 'video_id' is now present due to the fix in the loader functions
-        vid = str(video.get("video_id", f"no_id_{page}_{i}")) 
-        unique_key_base = f"{prefix}_{vid}_{page}_{i}" 
+        vid = str(video.get("video_id", f"no_id_{page}_{i}"))
+        unique_key_base = f"{prefix}_{vid}_{page}_{i}"
 
         st.subheader(video.get("title", "No Title"))
         st.caption(f"{video.get('channel_name', 'Unknown Channel')} • {video.get('publish_date', 'Unknown Date')}")
-        
-        # Check for link existence and validity before calling st.video (Fix for 'about:blank' error)
+
         video_link = video.get("link")
         if video_link and isinstance(video_link, str) and video_link.startswith(("http", "https")):
             st.video(video_link)
         else:
             st.warning("⚠️ Video link is missing or invalid. Cannot display player.")
 
-
         col1, col2, col3 = st.columns(3)
-        
-        # --- Action Buttons ---
         with col1:
             if st.button("⬇️ Download", key=f"dl_{unique_key_base}"):
                 move_to_sheet(video, ALREADY_DOWNLOADED_SHEET)
@@ -411,10 +488,9 @@ def display_quickwatch_style_list(df, view_name, prefix, tickets_df):
                     remove_from_quickwatch(vid)
                 st.success(f"Video {vid} marked as not relevant and moved to '{NOT_RELEVANT_SHEET}'.")
                 st.rerun()
-        
+
         with col3:
             if vid in ticketed_ids:
-                # Safely retrieve ticket row
                 ticket_row = tickets_df[tickets_df["video_id"].astype(str) == vid]
                 if not ticket_row.empty:
                     ticket_row = ticket_row.iloc[0]
@@ -440,32 +516,28 @@ def display_quickwatch_style_list(df, view_name, prefix, tickets_df):
                         st.rerun()
                     else:
                         st.error(f"❌ Failed to create ticket: {result}")
-        
-        st.markdown("---") 
-    
-    # --- Bottom Pagination ---
+
+        st.markdown("---")
+
     bottom_page_col1, bottom_page_col2 = st.columns([1, 10])
     with bottom_page_col1:
         st.number_input("Page", 1, total_pages, page, key=f"{prefix}_page_bottom", label_visibility="collapsed")
     with bottom_page_col2:
         st.markdown(f"Page {page} of {total_pages}")
 
-
 # --- Authentication Check (Centralized) ---
 def check_authentication():
     """Checks session state and handles login/timeout."""
-    
     auth_time = st.session_state["login_time"]
     time_since_login = time.time() - auth_time
-    
+
     if st.session_state["authenticated"] and time_since_login <= LOGIN_TIMEOUT:
         return True
-    
+
     st.session_state["authenticated"] = False
-    
     st.markdown("## 🔐 Welcome to DemoUp Dashboard")
     password = st.text_input("Password", type="password")
-    
+
     if password == CORRECT_PASSWORD:
         st.session_state["authenticated"] = True
         st.session_state["login_time"] = time.time()
@@ -473,18 +545,26 @@ def check_authentication():
         st.rerun()
     elif password:
         st.error("❌ Incorrect password.")
-        
-    st.stop() 
+    st.stop()
 
 check_authentication()
 
 # ----------------------------------------------------------------------
 # Main Dashboard UI (Only executes if authenticated)
 # ----------------------------------------------------------------------
-
 st.title("📺 YouTube Video Dashboard")
 
-view = st.sidebar.radio("📂 Select View", ["⚡ QuickWatch", "🚫 Not Relevant", "📥 Already Downloaded", "📦 Archive (Official)", "📦 Archive (Third-Party)"])
+view = st.sidebar.radio(
+    "📂 Select View",
+    [
+        "⚡ QuickWatch",
+        "🚫 Not Relevant",
+        "📥 Already Downloaded",
+        "📦 Archive (Official)",
+        "📦 Archive (Third-Party)",
+        "🧩 Zendesk Ticket Allocation"
+    ]
+)
 
 tickets_df = load_tickets_created()
 
@@ -494,8 +574,8 @@ if view == "⚡ QuickWatch":
         if st.text_input("Admin Password", type="password", key="qw_admin_pw") == "demoup123":
             if st.button("🔁 Fetch Now", key="qw_fetch_btn"):
                 with st.spinner("Fetching..."):
-                    try: 
-                        # fetch_videos_main() # Placeholder/Admin Action
+                    try:
+                        # fetch_videos_main()  # Placeholder/Admin Action
                         st.success("✅ Fetched successfully. (Placeholder)")
                         st.rerun()
                     except Exception as e:
@@ -510,7 +590,6 @@ if view == "⚡ QuickWatch":
     filtered_df, start, end = apply_quickwatch_filters(df, "qw")
     display_quickwatch_style_list(filtered_df, "⚡ QuickWatch", "qw", tickets_df)
 
-
 # --- 🚫 Not Relevant ---
 elif view == "🚫 Not Relevant":
     st.header("🚫 Not Relevant Videos")
@@ -518,7 +597,6 @@ elif view == "🚫 Not Relevant":
     if df.empty:
         st.info("No videos marked as Not Relevant in the Google Sheet.")
         st.stop()
-        
     filtered_df, start, end = apply_quickwatch_filters(df, "nr")
     display_quickwatch_style_list(filtered_df, "🚫 Not Relevant", "nr", tickets_df)
 
@@ -529,7 +607,6 @@ elif view == "📥 Already Downloaded":
     if df.empty:
         st.info("No videos marked as Already Downloaded in the Google Sheet.")
         st.stop()
-        
     filtered_df, start, end = apply_quickwatch_filters(df, "ad")
     display_quickwatch_style_list(filtered_df, "📥 Already Downloaded", "ad", tickets_df)
 
@@ -537,23 +614,75 @@ elif view == "📥 Already Downloaded":
 elif view == "📦 Archive (Official)":
     st.header("📦 Official Video Archive")
     df = load_official_archive()
-
     if df.empty:
         st.warning("⚠️ Official Archive is empty or failed to load.")
         st.stop()
-    
     filtered_df, start, end = apply_quickwatch_filters(df, "arch_off")
     display_quickwatch_style_list(filtered_df, "📦 Archive (Official)", "arch_off", tickets_df)
-
 
 # --- 📦 Archive (Third-Party) ---
 elif view == "📦 Archive (Third-Party)":
     st.header("📦 Third-Party Video Archive")
     df = load_third_party_archive()
-
     if df.empty:
         st.warning("⚠️ Third-Party Archive is empty or failed to load.")
         st.stop()
-
     filtered_df, start, end = apply_quickwatch_filters(df, "arch_tp")
     display_quickwatch_style_list(filtered_df, "📦 Archive (Third-Party)", "arch_tp", tickets_df)
+
+# --- 🧩 Zendesk Ticket Allocation ---
+elif view == "🧩 Zendesk Ticket Allocation":
+    st.header("🧩 Zendesk Ticket Allocation")
+    st.caption("Press the button to run round-robin assignment of the Light Agent custom field across selected agents.")
+
+    with st.expander("Current configuration"):
+        st.write({
+            "subdomain": ZENDESK_SUBDOMAIN,
+            "email": ZENDESK_EMAIL,
+            "view_id": ZENDESK_VIEW_ID,
+            "light_agent_field_id": ZENDESK_LIGHT_AGENT_FIELD_ID,
+            "agent_ids": ZENDESK_AGENT_IDS,
+        })
+
+    if not (ZENDESK_SUBDOMAIN and ZENDESK_EMAIL and ZENDESK_API_TOKEN and
+            ZENDESK_VIEW_ID and ZENDESK_LIGHT_AGENT_FIELD_ID and ZENDESK_AGENT_IDS):
+        st.error("Zendesk configuration incomplete. Please set all ZENDESK_* secrets (including agent IDs).")
+        st.stop()
+
+    colA, colB = st.columns([1, 1])
+    with colA:
+        dry_run = st.checkbox("Dry run (fetch & show distribution, don't update)", value=False)
+    with colB:
+        confirm = st.checkbox("I confirm I want to start allocation", value=False)
+
+    if st.button("🚀 Run Round-Robin Allocation", disabled=not confirm):
+        with st.spinner("Running allocation..."):
+            try:
+                if dry_run:
+                    ids = zd_get_tickets_from_view(ZENDESK_VIEW_ID)
+                    total = len(ids)
+                    if not total:
+                        st.info("No tickets found in the view.")
+                        st.stop()
+                    base = total // len(ZENDESK_AGENT_IDS)
+                    rem = total % len(ZENDESK_AGENT_IDS)
+                    dist = [{"agent_id": aid, "count": base + (1 if i < rem else 0)}
+                            for i, aid in enumerate(ZENDESK_AGENT_IDS)]
+                    st.success(f"Dry run: {total} tickets would be allocated.")
+                    st.dataframe(pd.DataFrame(dist))
+                else:
+                    result = zd_mass_assign_light_agent_round_robin(
+                        ZENDESK_VIEW_ID,
+                        ZENDESK_LIGHT_AGENT_FIELD_ID,
+                        ZENDESK_AGENT_IDS
+                    )
+                    st.success(f"Batch jobs started for {result['total']} tickets.")
+                    if result["distribution"]:
+                        st.subheader("Planned Distribution")
+                        st.dataframe(pd.DataFrame(result["distribution"]))
+                    if result["jobs"]:
+                        st.subheader("Job Status URLs")
+                        for j in result["jobs"]:
+                            st.write(f"Agent {j['agent_id']}: {j['url']}")
+            except Exception as e:
+                st.error(f"Failed to run allocation: {e}")
